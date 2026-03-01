@@ -26,13 +26,17 @@ struct ConfigFile {
     agent_max_rounds: Option<u32>,
 }
 
-fn load_config_file() -> ConfigFile {
-    let path = dirs::config_dir()
+fn config_path() -> PathBuf {
+    dirs::config_dir()
         .map(|d| d.join("cabal.toml"))
         .unwrap_or_else(|| {
             PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
                 .join(".config/cabal.toml")
-        });
+        })
+}
+
+fn load_config_file() -> ConfigFile {
+    let path = config_path();
 
     match std::fs::read_to_string(&path) {
         Ok(contents) => match toml::from_str::<ConfigFile>(&contents) {
@@ -77,6 +81,9 @@ EXAMPLE:
     max_rounds = 3"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// The question or task to deliberate on (mutually exclusive with -f).
     #[arg(short, long, conflicts_with = "question_file")]
     question: Option<String>,
@@ -114,6 +121,12 @@ struct Cli {
     agent_max_rounds: Option<u32>,
 }
 
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Generate a default ~/.config/cabal.toml configuration file.
+    GenerateConfig,
+}
+
 /// Resolved configuration with all defaults applied.
 struct ResolvedConfig {
     question: String,
@@ -124,6 +137,38 @@ struct ResolvedConfig {
     max_tokens: u32,
     temperature: f32,
     agent_max_rounds: u32,
+}
+
+const DEFAULT_CONFIG: &str = r#"boss_model = "openai/gpt-5.3-codex"
+models = [
+    "z-ai/glm-5",
+    "openai/gpt-5.3-codex",
+    "anthropic/claude-opus-4.6",
+    "google/gemini-3.1-pro-preview",
+    "deepseek/deepseek-v3.2",
+    "x-ai/grok-4.1-fast",
+]
+max_rounds = 3
+# max_tokens = 4096
+# temperature = 0.3
+# agent_max_rounds = 15
+"#;
+
+fn generate_config() -> Result<(), Box<dyn std::error::Error>> {
+    let path = config_path();
+
+    if path.exists() {
+        eprintln!("Config file already exists: {}", path.display());
+        eprintln!("Remove it first if you want to regenerate.");
+        std::process::exit(1);
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, DEFAULT_CONFIG)?;
+    println!("Generated config: {}", path.display());
+    Ok(())
 }
 
 fn resolve_config(cli: Cli, cfg: ConfigFile) -> Result<ResolvedConfig, String> {
@@ -792,6 +837,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+
+    if let Some(Command::GenerateConfig) = cli.command {
+        return generate_config();
+    }
+
     let cfg = load_config_file();
     let rc = resolve_config(cli, cfg).map_err(|e| {
         eprintln!("Error: {e}");
