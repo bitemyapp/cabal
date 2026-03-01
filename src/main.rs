@@ -24,6 +24,7 @@ struct ConfigFile {
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     agent_max_rounds: Option<u32>,
+    max_repeated_failures: Option<u32>,
 }
 
 fn config_path() -> PathBuf {
@@ -119,6 +120,10 @@ struct Cli {
     /// Max tool-use rounds per analyst harness invocation. Overrides config file.
     #[arg(long)]
     agent_max_rounds: Option<u32>,
+
+    /// Abort an agent after this many consecutive identical failing tool calls.
+    #[arg(long)]
+    max_repeated_failures: Option<u32>,
 }
 
 #[derive(clap::Subcommand)]
@@ -137,6 +142,7 @@ struct ResolvedConfig {
     max_tokens: u32,
     temperature: f32,
     agent_max_rounds: u32,
+    max_repeated_failures: u32,
 }
 
 const DEFAULT_CONFIG: &str = r#"boss_model = "openai/gpt-5.3-codex"
@@ -152,6 +158,7 @@ max_rounds = 3
 # max_tokens = 4096
 # temperature = 0.3
 # agent_max_rounds = 50
+# max_repeated_failures = 3
 "#;
 
 fn generate_config() -> Result<(), Box<dyn std::error::Error>> {
@@ -204,6 +211,10 @@ fn resolve_config(cli: Cli, cfg: ConfigFile) -> Result<ResolvedConfig, String> {
         max_tokens: cli.max_tokens.or(cfg.max_tokens).unwrap_or(4096),
         temperature: cli.temperature.or(cfg.temperature).unwrap_or(0.3),
         agent_max_rounds: cli.agent_max_rounds.or(cfg.agent_max_rounds).unwrap_or(50),
+        max_repeated_failures: cli
+            .max_repeated_failures
+            .or(cfg.max_repeated_failures)
+            .unwrap_or(3),
     })
 }
 
@@ -334,9 +345,79 @@ impl SessionMetrics {
     }
 }
 
+// ── Stuck-loop detection ─────────────────────────────────────────────
+
+/// Detects when a model repeatedly produces the same failing tool call.
+/// Shared between the event handler (which records calls) and the stop
+/// signal (which checks the abort flag).
+struct StuckLoopDetector {
+    /// How many consecutive identical failures before aborting.
+    threshold: u32,
+    /// Signature of the last failing tool call: (name, arguments).
+    last_failure: Option<(String, String)>,
+    /// How many times the current failure has repeated.
+    consecutive_failures: u32,
+    /// Set to true when the threshold is hit.
+    aborted: bool,
+    /// Label for log messages.
+    label: String,
+    /// The last tool call we saw (before we know the result).
+    pending_call: Option<(String, String)>,
+}
+
+impl StuckLoopDetector {
+    fn new(label: String, threshold: u32) -> Self {
+        Self {
+            threshold,
+            last_failure: None,
+            consecutive_failures: 0,
+            aborted: false,
+            label,
+            pending_call: None,
+        }
+    }
+
+    fn on_tool_executing(&mut self, name: &str, arguments: &str) {
+        self.pending_call = Some((name.to_string(), arguments.to_string()));
+    }
+
+    fn on_tool_result(&mut self, _name: &str, result: &str) {
+        let Some(call) = self.pending_call.take() else {
+            return;
+        };
+        let is_error = result.starts_with("Error");
+        if is_error {
+            if self.last_failure.as_ref() == Some(&call) {
+                self.consecutive_failures += 1;
+            } else {
+                self.last_failure = Some(call);
+                self.consecutive_failures = 1;
+            }
+            if self.consecutive_failures >= self.threshold {
+                warn!(
+                    "[{}] Stuck loop detected: same failing tool call repeated {} times, aborting",
+                    self.label, self.consecutive_failures
+                );
+                self.aborted = true;
+            }
+        } else {
+            // Successful call resets the counter.
+            self.last_failure = None;
+            self.consecutive_failures = 0;
+        }
+    }
+
+    fn should_stop(&self) -> bool {
+        self.aborted
+    }
+}
+
 // ── Event handler ────────────────────────────────────────────────────
 
-fn agent_event_handler(label: &str) -> impl EventHandler + '_ {
+fn agent_event_handler<'a>(
+    label: &'a str,
+    detector: &'a Mutex<StuckLoopDetector>,
+) -> impl EventHandler + 'a {
     EventObserver::new(move |event: &HarnessEvent<'_>| match event {
         HarnessEvent::RoundStart {
             round, max_rounds, ..
@@ -358,6 +439,7 @@ fn agent_event_handler(label: &str) -> impl EventHandler + '_ {
                 "[{label}] Tool call: {name}({args_preview}{})",
                 if arguments.len() > 200 { "..." } else { "" }
             );
+            detector.lock().unwrap().on_tool_executing(name, arguments);
         }
         HarnessEvent::ToolResult { name, result, .. } => {
             let preview: String = result.chars().take(300).collect();
@@ -365,6 +447,7 @@ fn agent_event_handler(label: &str) -> impl EventHandler + '_ {
                 "[{label}] Tool result {name}: {preview}{}",
                 if result.len() > 300 { "..." } else { "" }
             );
+            detector.lock().unwrap().on_tool_result(name, result);
         }
         HarnessEvent::Finished => {
             info!("[{label}] Finished (no more tool calls)");
@@ -441,6 +524,7 @@ struct AnalystParams<'a> {
     max_tokens: u32,
     temperature: f32,
     agent_max_rounds: u32,
+    max_repeated_failures: u32,
     metrics: &'a Mutex<SessionMetrics>,
 }
 
@@ -454,6 +538,7 @@ async fn run_analyst(params: AnalystParams<'_>) -> Result<AgentAnalysis, String>
         max_tokens,
         temperature,
         agent_max_rounds,
+        max_repeated_failures,
         metrics,
     } = params;
     info!(agent_id, model, "Starting analyst initial analysis");
@@ -495,9 +580,11 @@ async fn run_analyst(params: AnalystParams<'_>) -> Result<AgentAnalysis, String>
     ];
 
     let label = format!("Agent#{agent_id}");
-    let handler = agent_event_handler(&label);
+    let detector = Mutex::new(StuckLoopDetector::new(label.clone(), max_repeated_failures));
+    let handler = agent_event_handler(&label, &detector);
     let harness_result = Harness::new(client, &tools, config)
         .with_event_handler(&handler)
+        .with_stop_signal(|| detector.lock().unwrap().should_stop())
         .run(messages)
         .await?;
 
@@ -515,6 +602,11 @@ async fn run_analyst(params: AnalystParams<'_>) -> Result<AgentAnalysis, String>
         cost = harness_result.estimated_cost_usd,
         "Analyst finished initial analysis"
     );
+
+    let aborted = detector.lock().unwrap().aborted;
+    if aborted {
+        return Err(format!("Agent #{agent_id} aborted: stuck in a loop"));
+    }
 
     let submitted = result_slot
         .lock()
@@ -541,6 +633,7 @@ struct ReviewParams<'a> {
     prior_context: &'a [Message],
     max_tokens: u32,
     temperature: f32,
+    max_repeated_failures: u32,
     metrics: &'a Mutex<SessionMetrics>,
 }
 
@@ -553,6 +646,7 @@ async fn run_review(params: ReviewParams<'_>) -> Result<(AgentReview, Vec<Messag
         prior_context,
         max_tokens,
         temperature,
+        max_repeated_failures,
         metrics,
     } = params;
     info!(
@@ -618,9 +712,11 @@ async fn run_review(params: ReviewParams<'_>) -> Result<(AgentReview, Vec<Messag
     .with_temperature(temperature);
 
     let label = format!("Agent#{reviewer_id}->#{}", reviewed.agent_id);
-    let handler = agent_event_handler(&label);
+    let detector = Mutex::new(StuckLoopDetector::new(label.clone(), max_repeated_failures));
+    let handler = agent_event_handler(&label, &detector);
     let harness_result = Harness::new(client, &tools, config)
         .with_event_handler(&handler)
+        .with_stop_signal(|| detector.lock().unwrap().should_stop())
         .run(messages.clone())
         .await?;
 
@@ -646,6 +742,13 @@ async fn run_review(params: ReviewParams<'_>) -> Result<(AgentReview, Vec<Messag
         tokens = harness_result.total_tokens(),
         "Review complete"
     );
+
+    if detector.lock().unwrap().aborted {
+        return Err(format!(
+            "Agent #{reviewer_id} aborted reviewing #{}: stuck in a loop",
+            reviewed.agent_id
+        ));
+    }
 
     let submitted = result_slot
         .lock()
@@ -740,6 +843,7 @@ struct DossierParams<'a> {
     all_reviews: &'a [Vec<AgentReview>],
     consensus: &'a ConsensusReport,
     max_tokens: u32,
+    max_repeated_failures: u32,
     metrics: &'a Mutex<SessionMetrics>,
 }
 
@@ -752,6 +856,7 @@ async fn compile_dossier(params: DossierParams<'_>) -> Result<String, String> {
         all_reviews,
         consensus,
         max_tokens,
+        max_repeated_failures,
         metrics,
     } = params;
     info!("Boss compiling final dossier");
@@ -851,10 +956,15 @@ async fn compile_dossier(params: DossierParams<'_>) -> Result<String, String> {
 
     let messages = vec![Message::system(system_prompt), Message::user(&user_prompt)];
 
-    let handler = agent_event_handler("Boss");
+    let detector = Mutex::new(StuckLoopDetector::new(
+        "Boss".to_string(),
+        max_repeated_failures,
+    ));
+    let handler = agent_event_handler("Boss", &detector);
     let tools = ToolSet::new();
     let result = Harness::new(client, &tools, config)
         .with_event_handler(&handler)
+        .with_stop_signal(|| detector.lock().unwrap().should_stop())
         .run(messages)
         .await?;
 
@@ -927,6 +1037,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let max_tokens = rc.max_tokens;
         let temperature = rc.temperature;
         let agent_max_rounds = rc.agent_max_rounds;
+        let max_repeated_failures = rc.max_repeated_failures;
 
         analysis_handles.push(async move {
             run_analyst(AnalystParams {
@@ -938,6 +1049,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_tokens,
                 temperature,
                 agent_max_rounds,
+                max_repeated_failures,
                 metrics: metrics_ref,
             })
             .await
@@ -993,6 +1105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let metrics_ref = &metrics;
             let max_tokens = rc.max_tokens;
             let temperature = rc.temperature;
+            let max_repeated_failures = rc.max_repeated_failures;
 
             reviewer_handles.push(async move {
                 let mut reviews = Vec::new();
@@ -1010,6 +1123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         prior_context: &ctx,
                         max_tokens,
                         temperature,
+                        max_repeated_failures,
                         metrics: metrics_ref,
                     })
                     .await
@@ -1097,6 +1211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         all_reviews: &all_round_reviews,
         consensus: &consensus,
         max_tokens: rc.max_tokens,
+        max_repeated_failures: rc.max_repeated_failures,
         metrics: &metrics,
     })
     .await?;
