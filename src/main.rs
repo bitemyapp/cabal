@@ -809,8 +809,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!(agent_id = i, model = %m, "Analyst configured");
     }
 
-    let api_key = std::env::var("OPENROUTER_KEY")
-        .map_err(|_| "OPENROUTER_KEY environment variable not set")?;
+    let api_key = std::env::var("OPENROUTER_API_KEY")
+        .map_err(|_| "OPENROUTER_API_KEY environment variable not set")?;
     let client = OpenRouterClient::new(&api_key)?;
     let metrics = Mutex::new(SessionMetrics::default());
 
