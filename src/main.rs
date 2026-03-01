@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use cinch_rs::agent::config::{
@@ -10,6 +11,43 @@ use clap::Parser;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+
+// ── Config file ──────────────────────────────────────────────────────
+
+/// Loaded from ~/.config/cabal.toml
+#[derive(Deserialize, Default, Debug)]
+#[serde(default)]
+struct ConfigFile {
+    boss_model: Option<String>,
+    models: Vec<String>,
+    max_rounds: Option<u32>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    agent_max_rounds: Option<u32>,
+}
+
+fn load_config_file() -> ConfigFile {
+    let path = dirs::config_dir()
+        .map(|d| d.join("cabal.toml"))
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+                .join(".config/cabal.toml")
+        });
+
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => match toml::from_str::<ConfigFile>(&contents) {
+            Ok(cfg) => {
+                debug!(path = %path.display(), "Loaded config file");
+                cfg
+            }
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "Failed to parse config file, using defaults");
+                ConfigFile::default()
+            }
+        },
+        Err(_) => ConfigFile::default(),
+    }
+}
 
 // ── CLI ──────────────────────────────────────────────────────────────
 
@@ -31,41 +69,97 @@ EXAMPLE:
     --max-rounds 3
 
   Each -m flag adds one analyst agent using that model.
-  Repeat -m to add more agents to the deliberation."
+  Repeat -m to add more agents to the deliberation.
+
+  Defaults can be set in ~/.config/cabal.toml:
+    boss_model = \"openai/gpt-5.3-codex\"
+    models = [\"anthropic/claude-opus-4.6\", \"openai/gpt-5.3-codex\", \"google/gemini-3.1-pro-preview\"]
+    max_rounds = 3"
 )]
 struct Cli {
-    /// The question or task to deliberate on.
-    #[arg(short, long)]
-    question: String,
+    /// The question or task to deliberate on (mutually exclusive with -f).
+    #[arg(short, long, conflicts_with = "question_file")]
+    question: Option<String>,
 
-    /// Models to use for analyst agents (one per agent).
-    /// Example: -m z-ai/glm-5 -m openai/gpt-5.3-codex -m anthropic/claude-opus-4.6
-    #[arg(short, long = "model", required = true)]
+    /// Path to a file containing the question (mutually exclusive with -q).
+    #[arg(short = 'f', long, conflicts_with = "question")]
+    question_file: Option<PathBuf>,
+
+    /// Models to use for analyst agents (one per agent). Overrides config file.
+    #[arg(short, long = "model")]
     models: Vec<String>,
 
-    /// Model for the boss agent that compiles the final dossier.
-    #[arg(long, default_value = "anthropic/claude-sonnet-4")]
-    boss_model: String,
+    /// Model for the boss agent. Overrides config file.
+    #[arg(long)]
+    boss_model: Option<String>,
 
     /// Working directory for source code tools.
-    #[arg(short, long, default_value = ".")]
+    #[arg(short, long)]
+    workdir: Option<String>,
+
+    /// Maximum deliberation rounds. Overrides config file.
+    #[arg(long)]
+    max_rounds: Option<u32>,
+
+    /// Max tokens per LLM response. Overrides config file.
+    #[arg(long)]
+    max_tokens: Option<u32>,
+
+    /// Temperature for analyst agents. Overrides config file.
+    #[arg(long)]
+    temperature: Option<f32>,
+
+    /// Max tool-use rounds per analyst harness invocation. Overrides config file.
+    #[arg(long)]
+    agent_max_rounds: Option<u32>,
+}
+
+/// Resolved configuration with all defaults applied.
+struct ResolvedConfig {
+    question: String,
+    models: Vec<String>,
+    boss_model: String,
     workdir: String,
-
-    /// Maximum deliberation rounds (initial analysis + review rounds).
-    #[arg(long, default_value_t = 5)]
     max_rounds: u32,
-
-    /// Max tokens per LLM response.
-    #[arg(long, default_value_t = 4096)]
     max_tokens: u32,
-
-    /// Temperature for analyst agents.
-    #[arg(long, default_value_t = 0.3)]
     temperature: f32,
-
-    /// Max tool-use rounds per analyst harness invocation.
-    #[arg(long, default_value_t = 15)]
     agent_max_rounds: u32,
+}
+
+fn resolve_config(cli: Cli, cfg: ConfigFile) -> Result<ResolvedConfig, String> {
+    // Question: CLI only (no config file equivalent).
+    let question = match (&cli.question, &cli.question_file) {
+        (Some(q), _) => q.clone(),
+        (_, Some(path)) => std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read question file {}: {e}", path.display()))?,
+        _ => return Err("Provide either -q <question> or -f <file>".to_string()),
+    };
+
+    // Models: CLI overrides config if any -m flags were passed.
+    let models = if cli.models.is_empty() {
+        cfg.models
+    } else {
+        cli.models
+    };
+    if models.is_empty() {
+        return Err(
+            "No models specified. Use -m or set models in ~/.config/cabal.toml".to_string(),
+        );
+    }
+
+    Ok(ResolvedConfig {
+        question,
+        models,
+        boss_model: cli
+            .boss_model
+            .or(cfg.boss_model)
+            .unwrap_or_else(|| "anthropic/claude-sonnet-4".to_string()),
+        workdir: cli.workdir.unwrap_or_else(|| ".".to_string()),
+        max_rounds: cli.max_rounds.or(cfg.max_rounds).unwrap_or(5),
+        max_tokens: cli.max_tokens.or(cfg.max_tokens).unwrap_or(4096),
+        temperature: cli.temperature.or(cfg.temperature).unwrap_or(0.3),
+        agent_max_rounds: cli.agent_max_rounds.or(cfg.agent_max_rounds).unwrap_or(15),
+    })
 }
 
 // ── Tool argument types ──────────────────────────────────────────────
@@ -698,15 +792,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
-    let agent_count = cli.models.len();
+    let cfg = load_config_file();
+    let rc = resolve_config(cli, cfg).map_err(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    })?;
+    let agent_count = rc.models.len();
 
     info!(
         agent_count,
-        max_rounds = cli.max_rounds,
-        boss_model = %cli.boss_model,
+        max_rounds = rc.max_rounds,
+        boss_model = %rc.boss_model,
         "Starting cabal deliberation"
     );
-    for (i, m) in cli.models.iter().enumerate() {
+    for (i, m) in rc.models.iter().enumerate() {
         info!(agent_id = i, model = %m, "Analyst configured");
     }
 
@@ -719,14 +818,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Phase 1: Initial analysis");
 
     let mut analysis_handles = Vec::new();
-    for (i, model) in cli.models.iter().enumerate() {
+    for (i, model) in rc.models.iter().enumerate() {
         let client_ref = &client;
-        let question = &cli.question;
-        let workdir = &cli.workdir;
+        let question = &rc.question;
+        let workdir = &rc.workdir;
         let metrics_ref = &metrics;
-        let max_tokens = cli.max_tokens;
-        let temperature = cli.temperature;
-        let agent_max_rounds = cli.agent_max_rounds;
+        let max_tokens = rc.max_tokens;
+        let temperature = rc.temperature;
+        let agent_max_rounds = rc.agent_max_rounds;
 
         analysis_handles.push(async move {
             run_analyst(AnalystParams {
@@ -778,7 +877,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut agent_contexts: Vec<Vec<Message>> = (0..agent_count).map(|_| Vec::new()).collect();
     let mut all_round_reviews: Vec<Vec<AgentReview>> = Vec::new();
 
-    for round in 0..cli.max_rounds {
+    for round in 0..rc.max_rounds {
         info!(round = round + 1, "Deliberation round");
 
         let mut round_reviews: Vec<AgentReview> = Vec::new();
@@ -800,8 +899,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     reviewer_model: &reviewer.model,
                     reviewed,
                     prior_context,
-                    max_tokens: cli.max_tokens,
-                    temperature: cli.temperature,
+                    max_tokens: rc.max_tokens,
+                    temperature: rc.temperature,
                     metrics: &metrics,
                 })
                 .await
@@ -874,12 +973,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let dossier = compile_dossier(DossierParams {
         client: &client,
-        boss_model: &cli.boss_model,
-        question: &cli.question,
+        boss_model: &rc.boss_model,
+        question: &rc.question,
         analyses: &analyses,
         all_reviews: &all_round_reviews,
         consensus: &consensus,
-        max_tokens: cli.max_tokens,
+        max_tokens: rc.max_tokens,
         metrics: &metrics,
     })
     .await?;
