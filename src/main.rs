@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use cinch_rs::agent::config::{
@@ -123,6 +124,77 @@ struct AgentReview {
     new_points: Vec<String>,
 }
 
+// ── Per-model metrics tracking ────────────────────────────────────────
+
+#[derive(Default, Debug)]
+struct ModelMetrics {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    kv_cache_reused_tokens: u64,
+    api_calls: u64,
+}
+
+#[derive(Default)]
+struct SessionMetrics {
+    by_model: HashMap<String, ModelMetrics>,
+}
+
+impl SessionMetrics {
+    fn record(
+        &mut self,
+        model: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        kv_cache_reused_tokens: u64,
+    ) {
+        let entry = self.by_model.entry(model.to_string()).or_default();
+        entry.prompt_tokens += prompt_tokens;
+        entry.completion_tokens += completion_tokens;
+        entry.kv_cache_reused_tokens += kv_cache_reused_tokens;
+        entry.api_calls += 1;
+    }
+
+    fn emit_logs(&self) {
+        debug!("── Session token metrics ──────────────────────────────");
+        let mut total_prompt = 0u64;
+        let mut total_completion = 0u64;
+        let mut total_cached = 0u64;
+
+        for (model, m) in &self.by_model {
+            debug!(
+                model = %model,
+                api_calls = m.api_calls,
+                prompt_tokens = m.prompt_tokens,
+                completion_tokens = m.completion_tokens,
+                total_tokens = m.prompt_tokens + m.completion_tokens,
+                kv_cache_reused_tokens = m.kv_cache_reused_tokens,
+                "Model metrics"
+            );
+            total_prompt += m.prompt_tokens;
+            total_completion += m.completion_tokens;
+            total_cached += m.kv_cache_reused_tokens;
+        }
+
+        let total = total_prompt + total_completion;
+        let naive_total = total_prompt + total_completion + total_cached;
+        debug!(
+            models = self.by_model.len(),
+            total_prompt_tokens = total_prompt,
+            total_completion_tokens = total_completion,
+            total_tokens = total,
+            total_kv_cache_reused_tokens = total_cached,
+            naive_total_without_cache = naive_total,
+            cache_savings_pct = if naive_total > 0 {
+                format!("{:.1}%", total_cached as f64 / naive_total as f64 * 100.0)
+            } else {
+                "0.0%".to_string()
+            },
+            "Session totals"
+        );
+        debug!("───────────────────────────────────────────────────────");
+    }
+}
+
 // ── Build analyst tools ──────────────────────────────────────────────
 
 fn build_analyst_tools(workdir: &str, result: Arc<Mutex<Option<SubmitAnalysisArgs>>>) -> ToolSet {
@@ -181,6 +253,7 @@ struct AnalystParams<'a> {
     max_tokens: u32,
     temperature: f32,
     agent_max_rounds: u32,
+    metrics: &'a Mutex<SessionMetrics>,
 }
 
 async fn run_analyst(params: AnalystParams<'_>) -> Result<AgentAnalysis, String> {
@@ -193,6 +266,7 @@ async fn run_analyst(params: AnalystParams<'_>) -> Result<AgentAnalysis, String>
         max_tokens,
         temperature,
         agent_max_rounds,
+        metrics,
     } = params;
     info!(agent_id, model, "Starting analyst initial analysis");
 
@@ -238,6 +312,13 @@ async fn run_analyst(params: AnalystParams<'_>) -> Result<AgentAnalysis, String>
         .run(messages)
         .await?;
 
+    metrics.lock().unwrap().record(
+        model,
+        harness_result.total_prompt_tokens,
+        harness_result.total_completion_tokens,
+        0, // Initial analysis: no prior context, no KV cache reuse.
+    );
+
     debug!(
         agent_id,
         rounds = harness_result.rounds_used,
@@ -271,6 +352,7 @@ struct ReviewParams<'a> {
     prior_context: &'a [Message],
     max_tokens: u32,
     temperature: f32,
+    metrics: &'a Mutex<SessionMetrics>,
 }
 
 async fn run_review(params: ReviewParams<'_>) -> Result<(AgentReview, Vec<Message>), String> {
@@ -282,6 +364,7 @@ async fn run_review(params: ReviewParams<'_>) -> Result<(AgentReview, Vec<Messag
         prior_context,
         max_tokens,
         temperature,
+        metrics,
     } = params;
     info!(
         reviewer_id,
@@ -350,6 +433,21 @@ async fn run_review(params: ReviewParams<'_>) -> Result<(AgentReview, Vec<Messag
         .with_event_handler(&handler)
         .run(messages.clone())
         .await?;
+
+    // Estimate KV cache reuse: prior_context chars / 4 approximates tokens
+    // that form a cacheable prefix the provider doesn't need to recompute.
+    let prior_context_chars: usize = prior_context
+        .iter()
+        .map(|m| m.content.as_ref().map_or(0, |c| c.len()))
+        .sum();
+    let kv_cache_reused = (prior_context_chars / 4) as u64;
+
+    metrics.lock().unwrap().record(
+        reviewer_model,
+        harness_result.total_prompt_tokens,
+        harness_result.total_completion_tokens,
+        kv_cache_reused,
+    );
 
     debug!(
         reviewer_id,
@@ -444,15 +542,28 @@ fn check_consensus(
 
 // ── Boss agent: compile final dossier ────────────────────────────────
 
-async fn compile_dossier(
-    client: &OpenRouterClient,
-    boss_model: &str,
-    question: &str,
-    analyses: &[AgentAnalysis],
-    all_reviews: &[Vec<AgentReview>],
-    consensus: &ConsensusReport,
+struct DossierParams<'a> {
+    client: &'a OpenRouterClient,
+    boss_model: &'a str,
+    question: &'a str,
+    analyses: &'a [AgentAnalysis],
+    all_reviews: &'a [Vec<AgentReview>],
+    consensus: &'a ConsensusReport,
     max_tokens: u32,
-) -> Result<String, String> {
+    metrics: &'a Mutex<SessionMetrics>,
+}
+
+async fn compile_dossier(params: DossierParams<'_>) -> Result<String, String> {
+    let DossierParams {
+        client,
+        boss_model,
+        question,
+        analyses,
+        all_reviews,
+        consensus,
+        max_tokens,
+        metrics,
+    } = params;
     info!("Boss compiling final dossier");
 
     let system_prompt = "You are the Boss Agent compiling a final dossier from a multi-agent \
@@ -557,6 +668,13 @@ async fn compile_dossier(
         .run(messages)
         .await?;
 
+    metrics.lock().unwrap().record(
+        boss_model,
+        result.total_prompt_tokens,
+        result.total_completion_tokens,
+        0, // Boss: single call, no prior context reuse.
+    );
+
     debug!(
         tokens = result.total_tokens(),
         cost = result.estimated_cost_usd,
@@ -595,6 +713,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("OPENROUTER_KEY")
         .map_err(|_| "OPENROUTER_KEY environment variable not set")?;
     let client = OpenRouterClient::new(&api_key)?;
+    let metrics = Mutex::new(SessionMetrics::default());
 
     // ── Phase 1: Initial parallel analysis ───────────────────────────
     info!("Phase 1: Initial analysis");
@@ -604,6 +723,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let client_ref = &client;
         let question = &cli.question;
         let workdir = &cli.workdir;
+        let metrics_ref = &metrics;
         let max_tokens = cli.max_tokens;
         let temperature = cli.temperature;
         let agent_max_rounds = cli.agent_max_rounds;
@@ -618,6 +738,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_tokens,
                 temperature,
                 agent_max_rounds,
+                metrics: metrics_ref,
             })
             .await
         });
@@ -681,6 +802,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     prior_context,
                     max_tokens: cli.max_tokens,
                     temperature: cli.temperature,
+                    metrics: &metrics,
                 })
                 .await
                 {
@@ -750,15 +872,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         all_round_reviews.iter().flat_map(|r| r.clone()).collect();
     let consensus = check_consensus(&analyses, &all_reviews_flat, analyses.len());
 
-    let dossier = compile_dossier(
-        &client,
-        &cli.boss_model,
-        &cli.question,
-        &analyses,
-        &all_round_reviews,
-        &consensus,
-        cli.max_tokens,
-    )
+    let dossier = compile_dossier(DossierParams {
+        client: &client,
+        boss_model: &cli.boss_model,
+        question: &cli.question,
+        analyses: &analyses,
+        all_reviews: &all_round_reviews,
+        consensus: &consensus,
+        max_tokens: cli.max_tokens,
+        metrics: &metrics,
+    })
     .await?;
 
     // ── Output ───────────────────────────────────────────────────────
@@ -766,6 +889,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("CABAL DELIBERATION DOSSIER");
     println!("{}\n", "=".repeat(80));
     println!("{dossier}");
+
+    // ── Emit metrics (always recorded, logged at debug level) ────────
+    metrics.lock().unwrap().emit_logs();
 
     Ok(())
 }
