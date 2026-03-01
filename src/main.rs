@@ -151,7 +151,7 @@ models = [
 max_rounds = 3
 # max_tokens = 4096
 # temperature = 0.3
-# agent_max_rounds = 15
+# agent_max_rounds = 50
 "#;
 
 fn generate_config() -> Result<(), Box<dyn std::error::Error>> {
@@ -203,7 +203,7 @@ fn resolve_config(cli: Cli, cfg: ConfigFile) -> Result<ResolvedConfig, String> {
         max_rounds: cli.max_rounds.or(cfg.max_rounds).unwrap_or(5),
         max_tokens: cli.max_tokens.or(cfg.max_tokens).unwrap_or(4096),
         temperature: cli.temperature.or(cfg.temperature).unwrap_or(0.3),
-        agent_max_rounds: cli.agent_max_rounds.or(cfg.agent_max_rounds).unwrap_or(15),
+        agent_max_rounds: cli.agent_max_rounds.or(cfg.agent_max_rounds).unwrap_or(50),
     })
 }
 
@@ -981,50 +981,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for round in 0..rc.max_rounds {
         info!(round = round + 1, "Deliberation round");
 
-        let mut round_reviews: Vec<AgentReview> = Vec::new();
-
-        // Each agent reviews every other agent's analysis sequentially
-        // (one at a time as specified), but different reviewers run in parallel.
+        // Each reviewer processes other agents' analyses sequentially
+        // (to preserve KV cache continuity per reviewer), but different
+        // reviewers run in parallel.
+        let mut reviewer_handles = Vec::new();
         for reviewer_idx in 0..analyses.len() {
             let reviewer = &analyses[reviewer_idx];
+            let client_ref = &client;
+            let analyses_ref = &analyses;
+            let prior_context = &agent_contexts[reviewer_idx];
+            let metrics_ref = &metrics;
+            let max_tokens = rc.max_tokens;
+            let temperature = rc.temperature;
 
-            for (reviewed_idx, reviewed) in analyses.iter().enumerate() {
-                if reviewer_idx == reviewed_idx {
-                    continue;
-                }
-                let prior_context = &agent_contexts[reviewer_idx];
+            reviewer_handles.push(async move {
+                let mut reviews = Vec::new();
+                let mut ctx = prior_context.to_vec();
 
-                match run_review(ReviewParams {
-                    client: &client,
-                    reviewer_id: reviewer.agent_id,
-                    reviewer_model: &reviewer.model,
-                    reviewed,
-                    prior_context,
-                    max_tokens: rc.max_tokens,
-                    temperature: rc.temperature,
-                    metrics: &metrics,
-                })
-                .await
-                {
-                    Ok((review, updated_ctx)) => {
-                        debug!(
-                            reviewer = review.reviewer_id,
-                            reviewed = review.reviewed_id,
-                            agrees = review.agrees,
-                            "Review submitted"
-                        );
-                        agent_contexts[reviewer_idx] = updated_ctx;
-                        round_reviews.push(review);
+                for (reviewed_idx, reviewed) in analyses_ref.iter().enumerate() {
+                    if reviewer_idx == reviewed_idx {
+                        continue;
                     }
-                    Err(e) => {
-                        warn!(
-                            reviewer = reviewer_idx,
-                            reviewed = reviewed_idx,
-                            "Review failed: {e}"
-                        );
+                    match run_review(ReviewParams {
+                        client: client_ref,
+                        reviewer_id: reviewer.agent_id,
+                        reviewer_model: &reviewer.model,
+                        reviewed,
+                        prior_context: &ctx,
+                        max_tokens,
+                        temperature,
+                        metrics: metrics_ref,
+                    })
+                    .await
+                    {
+                        Ok((review, updated_ctx)) => {
+                            debug!(
+                                reviewer = review.reviewer_id,
+                                reviewed = review.reviewed_id,
+                                agrees = review.agrees,
+                                "Review submitted"
+                            );
+                            ctx = updated_ctx;
+                            reviews.push(review);
+                        }
+                        Err(e) => {
+                            warn!(
+                                reviewer = reviewer_idx,
+                                reviewed = reviewed_idx,
+                                "Review failed: {e}"
+                            );
+                        }
                     }
                 }
-            }
+                (reviewer_idx, reviews, ctx)
+            });
+        }
+
+        let reviewer_results = futures::future::join_all(reviewer_handles).await;
+        let mut round_reviews: Vec<AgentReview> = Vec::new();
+        for (reviewer_idx, reviews, updated_ctx) in reviewer_results {
+            agent_contexts[reviewer_idx] = updated_ctx;
+            round_reviews.extend(reviews);
         }
 
         all_round_reviews.push(round_reviews.clone());
