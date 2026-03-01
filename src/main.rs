@@ -334,6 +334,55 @@ impl SessionMetrics {
     }
 }
 
+// ── Event handler ────────────────────────────────────────────────────
+
+fn agent_event_handler(label: &str) -> impl EventHandler + '_ {
+    EventObserver::new(move |event: &HarnessEvent<'_>| match event {
+        HarnessEvent::RoundStart {
+            round, max_rounds, ..
+        } => {
+            info!("[{label}] Round {round}/{max_rounds}");
+        }
+        HarnessEvent::Text(text) => {
+            info!("[{label}] Response: {text}");
+        }
+        HarnessEvent::Reasoning(text) => {
+            info!("[{label}] Reasoning: {text}");
+        }
+        HarnessEvent::ToolCallsReceived { count, round } => {
+            info!("[{label}] {count} tool call(s) in round {round}");
+        }
+        HarnessEvent::ToolExecuting { name, arguments } => {
+            let args_preview: String = arguments.chars().take(200).collect();
+            info!(
+                "[{label}] Tool call: {name}({args_preview}{})",
+                if arguments.len() > 200 { "..." } else { "" }
+            );
+        }
+        HarnessEvent::ToolResult { name, result, .. } => {
+            let preview: String = result.chars().take(300).collect();
+            info!(
+                "[{label}] Tool result {name}: {preview}{}",
+                if result.len() > 300 { "..." } else { "" }
+            );
+        }
+        HarnessEvent::Finished => {
+            info!("[{label}] Finished (no more tool calls)");
+        }
+        HarnessEvent::RoundLimitReached { max_rounds } => {
+            info!("[{label}] Hit round limit ({max_rounds})");
+        }
+        HarnessEvent::EmptyResponse {
+            attempt,
+            max_retries,
+            ..
+        } => {
+            warn!("[{label}] Empty response, retrying ({attempt}/{max_retries})");
+        }
+        _ => {}
+    })
+}
+
 // ── Build analyst tools ──────────────────────────────────────────────
 
 fn build_analyst_tools(workdir: &str, result: Arc<Mutex<Option<SubmitAnalysisArgs>>>) -> ToolSet {
@@ -445,7 +494,8 @@ async fn run_analyst(params: AnalystParams<'_>) -> Result<AgentAnalysis, String>
         Message::user(format!("Question: {question}")),
     ];
 
-    let handler = LoggingHandler;
+    let label = format!("Agent#{agent_id}");
+    let handler = agent_event_handler(&label);
     let harness_result = Harness::new(client, &tools, config)
         .with_event_handler(&handler)
         .run(messages)
@@ -567,7 +617,8 @@ async fn run_review(params: ReviewParams<'_>) -> Result<(AgentReview, Vec<Messag
     .with_max_tokens(max_tokens)
     .with_temperature(temperature);
 
-    let handler = LoggingHandler;
+    let label = format!("Agent#{reviewer_id}->#{}", reviewed.agent_id);
+    let handler = agent_event_handler(&label);
     let harness_result = Harness::new(client, &tools, config)
         .with_event_handler(&handler)
         .run(messages.clone())
@@ -800,7 +851,7 @@ async fn compile_dossier(params: DossierParams<'_>) -> Result<String, String> {
 
     let messages = vec![Message::system(system_prompt), Message::user(&user_prompt)];
 
-    let handler = LoggingHandler;
+    let handler = agent_event_handler("Boss");
     let tools = ToolSet::new();
     let result = Harness::new(client, &tools, config)
         .with_event_handler(&handler)
