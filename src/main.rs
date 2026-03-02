@@ -412,6 +412,44 @@ impl StuckLoopDetector {
     }
 }
 
+// ── Cohort progress tracking ─────────────────────────────────────────
+
+/// Tracks how many parallel agents have completed, so remaining agents
+/// can abort early when the minimum viable cohort is no longer reachable.
+struct CohortProgress {
+    total: usize,
+    successes: usize,
+    failures: usize,
+    min_required: usize,
+}
+
+impl CohortProgress {
+    fn new(total: usize, min_required: usize) -> Self {
+        Self {
+            total,
+            successes: 0,
+            failures: 0,
+            min_required,
+        }
+    }
+
+    fn record_success(&mut self) {
+        self.successes += 1;
+    }
+
+    fn record_failure(&mut self) {
+        self.failures += 1;
+    }
+
+    fn remaining(&self) -> usize {
+        self.total - self.successes - self.failures
+    }
+
+    fn should_abort(&self) -> bool {
+        self.successes + self.remaining() < self.min_required
+    }
+}
+
 // ── Event handler ────────────────────────────────────────────────────
 
 fn agent_event_handler<'a>(
@@ -525,6 +563,7 @@ struct AnalystParams<'a> {
     temperature: f32,
     agent_max_rounds: u32,
     max_repeated_failures: u32,
+    cohort: &'a Mutex<CohortProgress>,
     metrics: &'a Mutex<SessionMetrics>,
 }
 
@@ -539,6 +578,7 @@ async fn run_analyst(params: AnalystParams<'_>) -> Result<AgentAnalysis, String>
         temperature,
         agent_max_rounds,
         max_repeated_failures,
+        cohort,
         metrics,
     } = params;
     info!(agent_id, model, "Starting analyst initial analysis");
@@ -584,7 +624,9 @@ async fn run_analyst(params: AnalystParams<'_>) -> Result<AgentAnalysis, String>
     let handler = agent_event_handler(&label, &detector);
     let harness_result = Harness::new(client, &tools, config)
         .with_event_handler(&handler)
-        .with_stop_signal(|| detector.lock().unwrap().should_stop())
+        .with_stop_signal(|| {
+            detector.lock().unwrap().should_stop() || cohort.lock().unwrap().should_abort()
+        })
         .run(messages)
         .await?;
 
@@ -604,11 +646,21 @@ async fn run_analyst(params: AnalystParams<'_>) -> Result<AgentAnalysis, String>
         "Analyst finished initial analysis"
     );
 
-    let aborted = detector.lock().unwrap().aborted;
-    if aborted {
+    if detector.lock().unwrap().aborted {
         return Err(format!(
             "Agent #{agent_id} ({model}) aborted: stuck in a loop"
         ));
+    }
+
+    {
+        let progress = cohort.lock().unwrap();
+        if progress.should_abort() {
+            return Err(format!(
+                "Agent #{agent_id} ({model}) aborted: insufficient viable agents \
+                 ({} succeeded, {} failed out of {}, need {})",
+                progress.successes, progress.failures, progress.total, progress.min_required,
+            ));
+        }
     }
 
     let submitted = result_slot
@@ -1033,19 +1085,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Phase 1: Initial parallel analysis ───────────────────────────
     info!("Phase 1: Initial analysis");
 
+    let cohort = Mutex::new(CohortProgress::new(rc.models.len(), 2));
+
     let mut analysis_handles = Vec::new();
     for (i, model) in rc.models.iter().enumerate() {
         let client_ref = &client;
         let question = &rc.question;
         let workdir = &rc.workdir;
         let metrics_ref = &metrics;
+        let cohort_ref = &cohort;
         let max_tokens = rc.max_tokens;
         let temperature = rc.temperature;
         let agent_max_rounds = rc.agent_max_rounds;
         let max_repeated_failures = rc.max_repeated_failures;
 
         analysis_handles.push(async move {
-            run_analyst(AnalystParams {
+            let result = run_analyst(AnalystParams {
                 client: client_ref,
                 agent_id: i,
                 model,
@@ -1055,9 +1110,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 temperature,
                 agent_max_rounds,
                 max_repeated_failures,
+                cohort: cohort_ref,
                 metrics: metrics_ref,
             })
-            .await
+            .await;
+
+            // Update cohort immediately so other in-flight agents can
+            // check viability on their next round boundary.
+            match &result {
+                Ok(_) => cohort_ref.lock().unwrap().record_success(),
+                Err(_) => cohort_ref.lock().unwrap().record_failure(),
+            }
+            result
         });
     }
 
