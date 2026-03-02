@@ -579,7 +579,7 @@ async fn run_analyst(params: AnalystParams<'_>) -> Result<AgentAnalysis, String>
         Message::user(format!("Question: {question}")),
     ];
 
-    let label = format!("Agent#{agent_id}");
+    let label = format!("Agent#{agent_id} {model}");
     let detector = Mutex::new(StuckLoopDetector::new(label.clone(), max_repeated_failures));
     let handler = agent_event_handler(&label, &detector);
     let harness_result = Harness::new(client, &tools, config)
@@ -597,6 +597,7 @@ async fn run_analyst(params: AnalystParams<'_>) -> Result<AgentAnalysis, String>
 
     debug!(
         agent_id,
+        model,
         rounds = harness_result.rounds_used,
         tokens = harness_result.total_tokens(),
         cost = harness_result.estimated_cost_usd,
@@ -605,14 +606,16 @@ async fn run_analyst(params: AnalystParams<'_>) -> Result<AgentAnalysis, String>
 
     let aborted = detector.lock().unwrap().aborted;
     if aborted {
-        return Err(format!("Agent #{agent_id} aborted: stuck in a loop"));
+        return Err(format!(
+            "Agent #{agent_id} ({model}) aborted: stuck in a loop"
+        ));
     }
 
     let submitted = result_slot
         .lock()
         .unwrap()
         .take()
-        .ok_or_else(|| format!("Agent #{agent_id} did not call submit_analysis"))?;
+        .ok_or_else(|| format!("Agent #{agent_id} ({model}) did not call submit_analysis"))?;
 
     Ok(AgentAnalysis {
         agent_id,
@@ -711,7 +714,10 @@ async fn run_review(params: ReviewParams<'_>) -> Result<(AgentReview, Vec<Messag
     .with_max_tokens(max_tokens)
     .with_temperature(temperature);
 
-    let label = format!("Agent#{reviewer_id}->#{}", reviewed.agent_id);
+    let label = format!(
+        "Agent#{reviewer_id} {reviewer_model}->#{}",
+        reviewed.agent_id
+    );
     let detector = Mutex::new(StuckLoopDetector::new(label.clone(), max_repeated_failures));
     let handler = agent_event_handler(&label, &detector);
     let harness_result = Harness::new(client, &tools, config)
@@ -745,16 +751,14 @@ async fn run_review(params: ReviewParams<'_>) -> Result<(AgentReview, Vec<Messag
 
     if detector.lock().unwrap().aborted {
         return Err(format!(
-            "Agent #{reviewer_id} aborted reviewing #{}: stuck in a loop",
+            "Agent #{reviewer_id} ({reviewer_model}) aborted reviewing #{}: stuck in a loop",
             reviewed.agent_id
         ));
     }
 
-    let submitted = result_slot
-        .lock()
-        .unwrap()
-        .take()
-        .ok_or_else(|| format!("Agent #{reviewer_id} did not call submit_review"))?;
+    let submitted = result_slot.lock().unwrap().take().ok_or_else(|| {
+        format!("Agent #{reviewer_id} ({reviewer_model}) did not call submit_review")
+    })?;
 
     let review = AgentReview {
         reviewer_id,
@@ -956,11 +960,12 @@ async fn compile_dossier(params: DossierParams<'_>) -> Result<String, String> {
 
     let messages = vec![Message::system(system_prompt), Message::user(&user_prompt)];
 
+    let boss_label = format!("Boss {boss_model}");
     let detector = Mutex::new(StuckLoopDetector::new(
-        "Boss".to_string(),
+        boss_label.clone(),
         max_repeated_failures,
     ));
-    let handler = agent_event_handler("Boss", &detector);
+    let handler = agent_event_handler(&boss_label, &detector);
     let tools = ToolSet::new();
     let result = Harness::new(client, &tools, config)
         .with_event_handler(&handler)
