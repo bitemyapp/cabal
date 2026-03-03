@@ -491,7 +491,13 @@ fn agent_event_handler<'a>(
             info!("[{label}] Finished (no more tool calls)");
         }
         HarnessEvent::RoundLimitReached { max_rounds } => {
-            info!("[{label}] Hit round limit ({max_rounds})");
+            // The harness fires this for ANY non-natural stop (including
+            // stop-signal abort). Only log it if neither detector already
+            // explains the stop.
+            let det = detector.lock().unwrap();
+            if !det.aborted {
+                info!("[{label}] Hit round limit ({max_rounds})");
+            }
         }
         HarnessEvent::EmptyResponse {
             attempt,
@@ -625,7 +631,19 @@ async fn run_analyst(params: AnalystParams<'_>) -> Result<AgentAnalysis, String>
     let harness_result = Harness::new(client, &tools, config)
         .with_event_handler(&handler)
         .with_stop_signal(|| {
-            detector.lock().unwrap().should_stop() || cohort.lock().unwrap().should_abort()
+            if detector.lock().unwrap().should_stop() {
+                return true;
+            }
+            let progress = cohort.lock().unwrap();
+            if progress.should_abort() {
+                warn!(
+                    "[{label}] Stopping: insufficient viable agents \
+                     ({} succeeded, {} failed out of {}, need {})",
+                    progress.successes, progress.failures, progress.total, progress.min_required,
+                );
+                return true;
+            }
+            false
         })
         .run(messages)
         .await?;
