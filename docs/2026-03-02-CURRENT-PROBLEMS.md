@@ -1,0 +1,7 @@
+It's roughly modeled on stuff like https://github.com/karpathy/llm-council and the many many many forks of it that exist, but I'm trying to accomplish a few things with my version:
+
+- I want to tune up the prompts to match how I've been doing the same thing manually for awhile now. It's annoying and slow copying and pasting agent responses back and forth. I think I have some insights into how to make it more effective and intelligent based on what I've been doing manually.
+
+- The OpenRouter API is kinda unreliable and it makes it annoying to get the minimum 2 agents required to drive toward consensus (there are round limits for the whole debate and for the individual inference cycles in the deliberation rounds). It doesn't require absolute consensus, if unanimity isn't achieved before the round max is hit, the boss agent just summarizes which points had unanimity, which had majority consent, and which were minority assertions.
+
+- The OpenRouter API doesn't seem (I could be wrong) to expose the same controls and APIs that the Anthropic API exposes for controlling stuff like KV cache. I'm not actually sure their API even supports intelligent routing for inference caching. I'd hope that it did but _I don't know_. Not having inference caching makes these debates extremely expensive because you're fanning out multiple agents (3 or more, generally. I do 2 or 3 manually) and the context window keeps growing as they go through rounds of analysis and debate.
